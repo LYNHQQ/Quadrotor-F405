@@ -51,3 +51,19 @@ void dshot_dma_cplt_callback(void);
 void dshot_dma_error_callback(void);
 void dshot_dma_burst_start(void);
 void dshot_dma_burst_stop(void);
+
+// 双向DShot遥测数据接口（假设已实现双向DShot接收）
+// 获取电机转速 (RPM或ERPM，根据电调反馈格式)
+// index: 电机索引 0-3
+// 返回: 转速值，如果数据无效返回-1
+float dshot_get_motor_speed(uint8_t index);
+
+// 检查电机转速数据是否有效
+// index: 电机索引 0-3
+// 返回: true表示数据有效，false表示数据无效或未收到
+bool dshot_is_motor_speed_valid(uint8_t index);
+
+// 更新电机转速数据（用户需要在双向DShot接收回调中调用此函数）
+// index: 电机索引 0-3
+// speed: 转速值 (RPM或ERPM)
+void dshot_update_motor_speed(uint8_t index, float speed);

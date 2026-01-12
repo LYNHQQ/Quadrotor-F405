@@ -1,5 +1,6 @@
 // 20250703 DSHOT Driver For STM32F4 HAL LL
 #include "dshot.h"
+#include "main.h"  // 包含HAL库定义
 
 // 关于TIM配置
 // MCU主频168MHz
@@ -112,4 +113,45 @@ void dshot_dma_cplt_callback(void)
 void dshot_dma_error_callback(void)
 {
 
+}
+
+// 双向DShot遥测数据（假设已实现双向DShot接收）
+// 这些变量需要用户根据实际的双向DShot实现来填充
+static float motor_speed[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // 电机转速 (RPM或ERPM)
+static bool motor_speed_valid[4] = {false, false, false, false};  // 数据有效性标志
+static uint32_t motor_speed_timestamp[4] = {0, 0, 0, 0};  // 数据时间戳
+#define MOTOR_SPEED_TIMEOUT_MS 100  // 数据超时时间（毫秒）
+
+// 获取电机转速（用户需要根据实际的双向DShot实现来调用此函数更新数据）
+float dshot_get_motor_speed(uint8_t index)
+{
+    if(index >= 4) return -1.0f;
+    if(!motor_speed_valid[index]) return -1.0f;
+    return motor_speed[index];
+}
+
+// 检查电机转速数据是否有效
+bool dshot_is_motor_speed_valid(uint8_t index)
+{
+    if(index >= 4) return false;
+    
+    // 检查数据是否超时
+    uint32_t current_time = HAL_GetTick();
+    if((current_time - motor_speed_timestamp[index]) > MOTOR_SPEED_TIMEOUT_MS) {
+        motor_speed_valid[index] = false;
+        return false;
+    }
+    
+    return motor_speed_valid[index];
+}
+
+// 更新电机转速数据（用户需要在双向DShot接收回调中调用此函数）
+// index: 电机索引 0-3
+// speed: 转速值 (RPM或ERPM)
+void dshot_update_motor_speed(uint8_t index, float speed)
+{
+    if(index >= 4) return;
+    motor_speed[index] = speed;
+    motor_speed_valid[index] = true;
+    motor_speed_timestamp[index] = HAL_GetTick();
 }

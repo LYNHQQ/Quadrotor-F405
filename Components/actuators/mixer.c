@@ -1,4 +1,6 @@
 #include "mixer.h"
+#include "motor_speed_controller.h"
+#include "dshot.h"
 
 // 四旋翼动力分配器
 // RP动力优先
@@ -70,4 +72,35 @@ void mixer_update(vfloat roll, vfloat pitch, vfloat yaw, vfloat thrust, vfloat *
     output[1] = M2_ROLL_SCALE * roll + M2_PITCH_SCALE * pitch + M2_YAW_SCALE * yaw + thrust;
     output[2] = M3_ROLL_SCALE * roll + M3_PITCH_SCALE * pitch + M3_YAW_SCALE * yaw + thrust;
     output[3] = M4_ROLL_SCALE * roll + M4_PITCH_SCALE * pitch + M4_YAW_SCALE * yaw + thrust;
+}
+
+// 带转速控制的动力分配
+void mixer_update_with_speed_control(
+    vfloat roll, vfloat pitch, vfloat yaw, vfloat thrust,
+    vfloat *speed_target, bool speed_control_enable, vfloat dt,
+    vfloat *output)
+{
+    // 先进行基础动力分配
+    mixer_update(roll, pitch, yaw, thrust, output);
+    
+    // 如果启用转速控制
+    if(speed_control_enable && speed_target != NULL && dt > 0.0f) {
+        // 对每个电机进行转速控制
+        for(uint8_t i = 0; i < 4; i++) {
+            // 获取实际转速
+            if(dshot_is_motor_speed_valid(i)) {
+                vfloat speed_actual = dshot_get_motor_speed(i);
+                
+                // 更新转速控制器
+                vfloat speed_adjust = motor_speed_controller_update(i, speed_actual, speed_target[i], dt);
+                
+                // 将转速控制输出叠加到电机输出上
+                output[i] += speed_adjust;
+                
+                // 限幅
+                if(output[i] > 1.0f) output[i] = 1.0f;
+                if(output[i] < 0.0f) output[i] = 0.0f;
+            }
+        }
+    }
 }

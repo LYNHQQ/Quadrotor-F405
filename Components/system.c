@@ -12,6 +12,8 @@
 #include "so3_controller.h"
 #include "butter.h"
 #include "mixer.h"
+#include "altitude_controller.h"
+#include "motor_speed_controller.h"
 
 /////////////////////////////////////////DEBUG/////////////////////////////////////////
 uint8_t log_buffer[128];
@@ -175,6 +177,23 @@ vfloat omega_goal[3];        // 目标角速度
 vfloat so3_output[3];        // SO3控制输出
 vfloat rf_last[3];           // 上一次的RF杆量
 uint32_t rf_last_timestamp = 0;
+flight_mode_t current_flight_mode = FLIGHT_MODE_ANGLE; // 默认自稳模式
+
+// 高度控制相关变量
+vfloat current_altitude = 0.0f;        // 当前高度 (m)
+vfloat target_altitude = 0.0f;        // 目标高度 (m)
+vfloat pressure_ref = 101325.0f;       // 参考气压 (Pa, 海平面标准气压)
+vfloat baro_pressure = 0.0f;           // 当前气压 (Pa)
+vfloat baro_temperature = 0.0f;        // 当前温度 (摄氏度)
+bool baro_ready = false;               // 气压计是否就绪
+uint32_t baro_init_time = 0;           // 气压计初始化时间
+#define BARO_INIT_DELAY_MS 2000         // 气压计初始化延迟（等待稳定）
+
+// 转速控制相关变量
+bool speed_control_enable = false;      // 是否启用转速控制（可通过参数或开关控制）
+vfloat motor_speed_target[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // 目标转速 (RPM或ERPM)
+#define BASE_MOTOR_SPEED 10000.0f       // 基础转速（根据实际电机调整，单位：RPM或ERPM）
+#define MAX_MOTOR_SPEED 20000.0f        // 最大转速
 
 // ACC GYRO 低通滤波器(实际因为延迟较大 可不使用)
 Butter3 omega_x_filter;
@@ -221,6 +240,22 @@ void system_init(void)
 
     slog("AHRS DCM Init\r\n");
     ahrs_dcm_init();
+
+    slog("SPL06 Init\r\n");
+    if(!spl06_init()){
+        slog("SPL06 Init Failed\r\n");
+        baro_ready = false;
+    }else{
+        slog("SPL06 Init Success\r\n");
+        baro_ready = true;
+        baro_init_time = HAL_GetTick();
+    }
+
+    slog("Altitude Controller Init\r\n");
+    altitude_controller_init();
+
+    slog("Motor Speed Controller Init\r\n");
+    motor_speed_controller_init();
 
     slog("Start 1KHz Timer\r\n");
     system_1khz_timer_start();
@@ -283,6 +318,14 @@ void system_loop(void)
         ahrs_dcm_get_euler(&roll, &pitch, &yaw); // 更新欧拉角
         ahrs_dcm_get_dcm(dcm); // 更新旋转矩阵
 
+        // 气压计更新（非阻塞）
+        if(baro_ready && (HAL_GetTick() - baro_init_time) > BARO_INIT_DELAY_MS) {
+            if(spl06_update_nonblocking(&baro_pressure, &baro_temperature)) {
+                // 计算当前高度
+                current_altitude = spl06_pressure_to_altitude(baro_pressure, pressure_ref, baro_temperature);
+            }
+        }
+
         // 20250710 打包发送IMU数据 以及对应油门数据 用于滤波器debug
         // imu_log_buffer[0] = 0xAA;
         // memcpy(&imu_log_buffer[1], &tp_ms, 4);
@@ -295,39 +338,130 @@ void system_loop(void)
         // ahrs_dcm_set_euler_bias(roll, pitch, yaw);
         // ahrs_dcm_set_dcm_bias(dcm);
 
-        vfloat crsf_norm_scale = DEG2RAD(60.0f); // 归一化输入到目标欧拉角度的比例
-        Matrix3FromEuler(crsf_norm_scale * crsf_data.roll, crsf_norm_scale * crsf_data.pitch, crsf_norm_scale * crsf_data.yaw, dcm_goal); // 使用接收机作为目标姿态
-        // Vector3Zero(omega_goal); // 目标角速度初始化为0
-
-        // 根据摇杆变化量计算目标角速度
-        #define OMEGA_BOOST (10)
-        if(crsf_data.timestamp_us > rf_last_timestamp){
-            rf_last_timestamp = crsf_data.timestamp_us;
-            omega_goal[0] = butter3_filter_update(&rf_roll_filter,  crsf_data.roll-rf_last[0] ) * crsf_norm_scale * OMEGA_BOOST;
-            omega_goal[1] = butter3_filter_update(&rf_pitch_filter, crsf_data.pitch-rf_last[1]) * crsf_norm_scale * OMEGA_BOOST;
-            omega_goal[2] = butter3_filter_update(&rf_yaw_filter,   crsf_data.yaw-rf_last[2]  ) * crsf_norm_scale * OMEGA_BOOST;
-            rf_last[0] = crsf_data.roll;
-            rf_last[1] = crsf_data.pitch;
-            rf_last[2] = crsf_data.yaw;
-            // slog_dma("omega goal: %.6f \t%.6f \t%.6f\r\n", omega_goal[0], omega_goal[1], omega_goal[2]);
+        // 根据遥控器开关切换飞行模式
+        // switch1 UP = 手动模式, MID = 自稳模式, DOWN = 定高模式
+        if(crsf_data.switch1 == SWITCH3_UP){
+            current_flight_mode = FLIGHT_MODE_MANUAL;
+        } else if(crsf_data.switch1 == SWITCH3_MID){
+            current_flight_mode = FLIGHT_MODE_ANGLE;
+        } else if(crsf_data.switch1 == SWITCH3_DOWN){
+            current_flight_mode = FLIGHT_MODE_ALT_HOLD;
+            // 进入定高模式时，记录当前高度作为目标高度
+            if(baro_ready && current_altitude > 0.0f) {
+                target_altitude = current_altitude;
+            }
+        } else {
+            current_flight_mode = FLIGHT_MODE_ANGLE; // 默认自稳模式
         }
 
-        // SO3 Control
-        so3_controller_update(dcm, dcm_goal, omega_filtered, omega_goal, so3_output);
-        // 控制量限幅
-        vfloat roll_control  = so3_output[0];
-        vfloat pitch_control = so3_output[1];
-        vfloat yaw_control   = so3_output[2];
-        roll_control  = (roll_control > 1.0f)? 1.0f : ((roll_control < -1.0f)? -1.0f : roll_control);
-        pitch_control = (pitch_control > 1.0f)? 1.0f : ((pitch_control < -1.0f)? -1.0f : pitch_control);
-        yaw_control   = (yaw_control > 1.0f)? 1.0f : ((yaw_control < -1.0f)? -1.0f : yaw_control);
-
         vfloat motor_speed[4]; // 电机速度数组
-        // 直接使用遥控器控制(动力分配测试):
-        // mixer_update(crsf_data.roll, crsf_data.pitch, crsf_data.yaw, crsf_data.throttle, motor_speed);
+        vfloat roll_control, pitch_control, yaw_control;
 
-        // 使用SO3控制 电机动力分配:
-        mixer_update(roll_control, pitch_control, yaw_control, crsf_data.throttle, motor_speed);
+        if(current_flight_mode == FLIGHT_MODE_MANUAL){
+            // 手动模式（Rate模式）：使用SO3控制器，但只进行角速度控制
+            // 目标姿态 = 当前姿态（姿态误差为0，不进行姿态稳定）
+            Matrix3Copy(dcm, dcm_goal);
+            
+            // 目标角速度直接来自摇杆输入（角速度控制模式）
+            vfloat rate_scale = DEG2RAD(400.0f); // 手动模式角速度比例，可根据需要调整
+            omega_goal[0] = crsf_data.roll * rate_scale;
+            omega_goal[1] = crsf_data.pitch * rate_scale;
+            omega_goal[2] = crsf_data.yaw * rate_scale;
+
+            // SO3 Control（姿态误差为0，只进行角速度控制）
+            so3_controller_update(dcm, dcm_goal, omega_filtered, omega_goal, so3_output);
+            // 控制量限幅
+            roll_control  = so3_output[0];
+            pitch_control = so3_output[1];
+            yaw_control   = so3_output[2];
+            roll_control  = (roll_control > 1.0f)? 1.0f : ((roll_control < -1.0f)? -1.0f : roll_control);
+            pitch_control = (pitch_control > 1.0f)? 1.0f : ((pitch_control < -1.0f)? -1.0f : pitch_control);
+            yaw_control   = (yaw_control > 1.0f)? 1.0f : ((yaw_control < -1.0f)? -1.0f : yaw_control);
+
+            // 使用SO3控制 电机动力分配（先计算基础输出）:
+            vfloat motor_speed_base[4];
+            mixer_update(roll_control, pitch_control, yaw_control, crsf_data.throttle, motor_speed_base);
+            
+            // 计算目标转速（根据基础输出映射到转速范围）
+            for(int i = 0; i < 4; i++) {
+                motor_speed_target[i] = BASE_MOTOR_SPEED + motor_speed_base[i] * (MAX_MOTOR_SPEED - BASE_MOTOR_SPEED);
+            }
+            
+            // 使用带转速控制的动力分配
+            mixer_update_with_speed_control(
+                roll_control, pitch_control, yaw_control, crsf_data.throttle,
+                motor_speed_target, speed_control_enable, (vfloat)dt_ms/1000.0f,
+                motor_speed
+            );
+        } else {
+            // 自稳模式（Angle模式）或定高模式：使用SO3姿态控制器
+            vfloat crsf_norm_scale = DEG2RAD(60.0f); // 归一化输入到目标欧拉角度的比例
+            Matrix3FromEuler(crsf_norm_scale * crsf_data.roll, crsf_norm_scale * crsf_data.pitch, crsf_norm_scale * crsf_data.yaw, dcm_goal); // 使用接收机作为目标姿态
+
+            // 根据摇杆变化量计算目标角速度
+            #define OMEGA_BOOST (10)
+            if(crsf_data.timestamp_us > rf_last_timestamp){
+                rf_last_timestamp = crsf_data.timestamp_us;
+                omega_goal[0] = butter3_filter_update(&rf_roll_filter,  crsf_data.roll-rf_last[0] ) * crsf_norm_scale * OMEGA_BOOST;
+                omega_goal[1] = butter3_filter_update(&rf_pitch_filter, crsf_data.pitch-rf_last[1]) * crsf_norm_scale * OMEGA_BOOST;
+                omega_goal[2] = butter3_filter_update(&rf_yaw_filter,   crsf_data.yaw-rf_last[2]  ) * crsf_norm_scale * OMEGA_BOOST;
+                rf_last[0] = crsf_data.roll;
+                rf_last[1] = crsf_data.pitch;
+                rf_last[2] = crsf_data.yaw;
+            }
+
+            // SO3 Control
+            so3_controller_update(dcm, dcm_goal, omega_filtered, omega_goal, so3_output);
+            // 控制量限幅
+            roll_control  = so3_output[0];
+            pitch_control = so3_output[1];
+            yaw_control   = so3_output[2];
+            roll_control  = (roll_control > 1.0f)? 1.0f : ((roll_control < -1.0f)? -1.0f : roll_control);
+            pitch_control = (pitch_control > 1.0f)? 1.0f : ((pitch_control < -1.0f)? -1.0f : pitch_control);
+            yaw_control   = (yaw_control > 1.0f)? 1.0f : ((yaw_control < -1.0f)? -1.0f : yaw_control);
+
+            // 计算油门值
+            vfloat throttle_output = crsf_data.throttle;
+
+            // 定高模式：叠加高度控制
+            if(current_flight_mode == FLIGHT_MODE_ALT_HOLD && baro_ready && current_altitude > 0.0f) {
+                // 允许通过油门摇杆微调目标高度（±5米范围）
+                #define ALT_ADJUST_RANGE 5.0f
+                target_altitude += crsf_data.throttle * ALT_ADJUST_RANGE * (vfloat)dt_ms / 1000.0f;
+                
+                // 限制目标高度范围
+                if(target_altitude < 0.0f) target_altitude = 0.0f;
+                if(target_altitude > 100.0f) target_altitude = 100.0f;
+
+                // 更新高度控制器
+                vfloat altitude_throttle_adjust = altitude_controller_update(current_altitude, target_altitude, (vfloat)dt_ms/1000.0f);
+                
+                // 将高度控制输出叠加到基础油门上
+                // 基础油门设为中等值（0.3-0.5），高度控制器在此基础上调整
+                vfloat base_throttle = 0.4f; // 基础悬停油门，需要根据实际调整
+                throttle_output = base_throttle + altitude_throttle_adjust;
+                
+                // 限幅
+                if(throttle_output > 1.0f) throttle_output = 1.0f;
+                if(throttle_output < 0.0f) throttle_output = 0.0f;
+            }
+
+            // 使用SO3控制 电机动力分配（先计算基础输出）:
+            vfloat motor_speed_base[4];
+            mixer_update(roll_control, pitch_control, yaw_control, throttle_output, motor_speed_base);
+            
+            // 计算目标转速（根据基础输出映射到转速范围）
+            for(int i = 0; i < 4; i++) {
+                motor_speed_target[i] = BASE_MOTOR_SPEED + motor_speed_base[i] * (MAX_MOTOR_SPEED - BASE_MOTOR_SPEED);
+            }
+            
+            // 使用带转速控制的动力分配
+            mixer_update_with_speed_control(
+                roll_control, pitch_control, yaw_control, throttle_output,
+                motor_speed_target, speed_control_enable, (vfloat)dt_ms/1000.0f,
+                motor_speed
+            );
+        }
 
         // DSHOT Update
         // ARM SWITCH CH5
@@ -347,6 +481,7 @@ void system_loop(void)
         log_count++;
         if(log_count > 10){ // 100Hz UART DMA 1M Baudrate Debug Output
             log_count = 0;
+            // slog_dma("Mode: %s\r\n", (current_flight_mode == FLIGHT_MODE_MANUAL) ? "MANUAL" : "ANGLE");
             // slog_dma("rf last: %.6f \t%.6f \t%.6f\r\n", rf_last[0], rf_last[1], rf_last[2]);
             // slog_dma("sqrt: %.2f\r\n", simple_sqrt(2.0f));
             // slog_dma("speed: %.2f %.2f %.2f %.2f\r\n", motor_speed[0], motor_speed[1], motor_speed[2], motor_speed[3]);
@@ -374,4 +509,10 @@ void system_loop(void)
             }
         }
     }
+}
+
+// 获取当前飞行模式
+flight_mode_t system_get_flight_mode(void)
+{
+    return current_flight_mode;
 }

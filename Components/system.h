@@ -32,3 +32,12 @@ uint32_t get_system_1khz_tick(void);
 
 bool button1_pressed(void);
 bool button2_pressed(void);
+
+// 飞行模式枚举
+typedef enum {
+    FLIGHT_MODE_MANUAL = 0,    // 手动模式（Rate模式）：使用SO3控制器进行角速度控制，摇杆控制目标角速度
+    FLIGHT_MODE_ANGLE = 1,     // 自稳模式（Angle模式）：使用SO3姿态控制器，摇杆控制目标姿态角度
+    FLIGHT_MODE_ALT_HOLD = 2   // 定高模式：在自稳模式基础上，自动保持高度
+} flight_mode_t;
+
+flight_mode_t system_get_flight_mode(void);

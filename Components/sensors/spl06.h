@@ -81,3 +81,14 @@ bool spl06_configure_measurements(void);
 bool spl06Detect(void);
 bool spl06_init(void);
 void spl06_update(void);
+
+// 非阻塞更新函数，返回当前气压和温度
+// 需要在主循环中周期性调用
+bool spl06_update_nonblocking(float* pressure, float* temperature);
+
+// 气压转高度 (使用标准大气模型)
+// pressure: 当前气压 (Pa)
+// pressure_ref: 参考气压 (Pa, 通常为海平面气压101325Pa)
+// temperature: 当前温度 (摄氏度)
+// 返回: 高度 (m)
+float spl06_pressure_to_altitude(float pressure, float pressure_ref, float temperature);

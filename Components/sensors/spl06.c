@@ -1,5 +1,8 @@
 #include "spl06.h"
 #include "stm32_i2c_driver.h"
+#include <math.h>
+#include "main.h"  // 包含HAL库定义
+#include "system.h"  // 包含slog函数
 
 static stm32_i2c_driver_t spl06_i2c;
 
@@ -51,10 +54,10 @@ bool spl06_start_temperature_measurement(void)
 bool spl06_read_temperature(void)
 {
     uint8_t data[SPL06_TEMPERATURE_LEN];
-    int32_t spl06_temperature;
+    int32_t temp_raw;
     bool ret = stm32_i2c_read(&spl06_i2c, SPL06_TEMPERATURE_START_REG, data, SPL06_TEMPERATURE_LEN);
-    spl06_temperature = (int32_t)((data[0] & 0x80 ? 0xFF000000 : 0) | (((uint32_t)(data[0])) << 16) | (((uint32_t)(data[1])) << 8) | ((uint32_t)data[2]));
-    spl06_temperature_raw = spl06_temperature;
+    temp_raw = (int32_t)((data[0] & 0x80 ? 0xFF000000 : 0) | (((uint32_t)(data[0])) << 16) | (((uint32_t)(data[1])) << 8) | ((uint32_t)data[2]));
+    spl06_temperature_raw = temp_raw;
     return ret;
 }
 
@@ -200,4 +203,100 @@ void spl06_update(void)
     spl06_read_pressure();
     spl06_calculate(&spl06_pressure, &spl06_temperature);
     slog("SPL06 Pressure: %d, Temperature: %d\r\n", (int)(spl06_pressure*100.0f), (int)(spl06_temperature*100.0f));
+}
+
+// 非阻塞更新状态机
+static enum {
+    SPL06_STATE_IDLE,
+    SPL06_STATE_TEMP_STARTED,
+    SPL06_STATE_TEMP_READ,
+    SPL06_STATE_PRESS_STARTED,
+    SPL06_STATE_PRESS_READ
+} spl06_state = SPL06_STATE_IDLE;
+
+static uint32_t spl06_measurement_start_time = 0;
+#define SPL06_MEASUREMENT_DELAY_MS 50
+
+bool spl06_update_nonblocking(float* pressure, float* temperature)
+{
+    uint32_t current_time = HAL_GetTick();
+    
+    switch(spl06_state) {
+        case SPL06_STATE_IDLE:
+            // 开始温度测量
+            if(spl06_start_temperature_measurement()) {
+                spl06_measurement_start_time = current_time;
+                spl06_state = SPL06_STATE_TEMP_STARTED;
+            }
+            return false;
+            
+        case SPL06_STATE_TEMP_STARTED:
+            // 等待温度测量完成
+            if((current_time - spl06_measurement_start_time) >= SPL06_MEASUREMENT_DELAY_MS) {
+                if(spl06_read_temperature()) {
+                    spl06_state = SPL06_STATE_TEMP_READ;
+                } else {
+                    spl06_state = SPL06_STATE_IDLE;
+                    return false;
+                }
+            }
+            return false;
+            
+        case SPL06_STATE_TEMP_READ:
+            // 开始气压测量
+            if(spl06_start_pressure_measurement()) {
+                spl06_measurement_start_time = current_time;
+                spl06_state = SPL06_STATE_PRESS_STARTED;
+            } else {
+                spl06_state = SPL06_STATE_IDLE;
+                return false;
+            }
+            return false;
+            
+        case SPL06_STATE_PRESS_STARTED:
+            // 等待气压测量完成
+            if((current_time - spl06_measurement_start_time) >= SPL06_MEASUREMENT_DELAY_MS) {
+                if(spl06_read_pressure()) {
+                    spl06_state = SPL06_STATE_PRESS_READ;
+                } else {
+                    spl06_state = SPL06_STATE_IDLE;
+                    return false;
+                }
+            }
+            return false;
+            
+        case SPL06_STATE_PRESS_READ:
+            // 计算并返回结果
+            if(spl06_calculate(&spl06_pressure, &spl06_temperature)) {
+                if(pressure) *pressure = spl06_pressure;
+                if(temperature) *temperature = spl06_temperature;
+                spl06_state = SPL06_STATE_IDLE;
+                return true;
+            } else {
+                spl06_state = SPL06_STATE_IDLE;
+                return false;
+            }
+            
+        default:
+            spl06_state = SPL06_STATE_IDLE;
+            return false;
+    }
+}
+
+// 气压转高度 (使用标准大气模型)
+// 公式: h = (T0 / L) * (1 - (P / P0)^(R*L / g))
+// 其中: T0 = 288.15K, L = 0.0065 K/m, R = 287.05 J/(kg*K), g = 9.80665 m/s^2
+// 简化公式: h = 44330 * (1 - (P / P0)^0.1903)
+float spl06_pressure_to_altitude(float pressure, float pressure_ref, float temperature)
+{
+    if(pressure <= 0.0f || pressure_ref <= 0.0f) {
+        return 0.0f;
+    }
+    
+    // 使用标准大气模型公式
+    // h = 44330 * (1 - (P / P0)^0.1903)
+    const float ratio = pressure / pressure_ref;
+    const float altitude = 44330.0f * (1.0f - powf(ratio, 0.1903f));
+    
+    return altitude;
 }
